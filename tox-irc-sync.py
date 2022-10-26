@@ -331,6 +331,7 @@ class SyniTox(Tox):
         nick = self._oArgs.group_nick
         # is the chat_id the pk?
         chat_id = self._oArgs.group_chatid
+        if not chat_id: return -1
         num = self.group_join(chat_id, password, nick, status='')
         self.sGROUP_BOT_NUM = num
         self.group_self_set_status(num, TOX_USER_STATUS['NONE'])
@@ -964,7 +965,7 @@ def oArgparse(lArgv):
                         choices=['public','private'],
                         help="state for the group - default public")
     parser.add_argument('--group_chatid', type=str, default='',
-                        help="chat_id of the group - will be created on first use")
+                        help="chat_id of the group - leave empty and will be created on first use")
     parser.add_argument('--group_name', type=str, default='',
                         help="name for the group")
     parser.add_argument('--group_nick', type=str, default='',
