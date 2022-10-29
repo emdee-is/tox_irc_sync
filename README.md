@@ -6,7 +6,7 @@ A bot that sync messages between IRC and Tox NGC group chat.
 
 Hard forked from <https://github.com/aitjcize/tox-irc-sync>
 and changed to use the Python wrapping from
-<https://git.macaw.me/emdee/toxygen_wrapper>.
+<https://git.plastiras.org/emdee/toxygen_wrapper>.
 Just clone that repo and put the resulting directory on your
 ```PYTHONPATH```.
 
@@ -144,13 +144,13 @@ python3 tox-irc-sync.py \
 
 ## ChangeLog
 
-* changed to use the Python wrapping from <https://git.macaw.me/emdee/toxygen_wrapper>
+* changed to use the Python wrapping from <https://git.plastiras.org/emdee/toxygen_wrapper>
 * ```tox_irc_sync``` does  SSL now.
 
 ### Future Directions
 
 1. It's intended as a IRC->Tox NGC gateway but it could work the other way round.
-2. It could be a plugin under  <https://git.macaw.me/emdee/toxygen>
+2. It could be a plugin under  <https://git.plastiras.org/emdee/toxygen>
    which would broaden the range of callbacks that could be supported.
 3. It could be a gateway to an existing NGC group with an invite bot.
 

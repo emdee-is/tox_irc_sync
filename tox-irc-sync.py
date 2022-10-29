@@ -14,6 +14,9 @@ from threading import Thread
 from random import shuffle
 from OpenSSL import SSL
 
+import warnings
+warnings.filterwarnings('ignore')
+
 import wrapper
 from wrapper.tox import Tox
 from wrapper.toxav import ToxAV
@@ -37,7 +40,9 @@ LOG = logging.getLogger('app.'+'ts')
 
 NAME = 'SyniTox'
 # possible CA locations picks the first one
-lCAs = ['/etc/ssl/cacert.pem']
+lCAs = ['/etc/ssl/cacert.pem',
+        # debian
+        '/etc/ssl/certs/']
 
 bot_toxname = 'SyniTox'
 
@@ -368,6 +373,7 @@ class SyniTox(Tox):
         return True
 
     def init_callbacks(self):
+        return
         # wraps self with
         LOG.info("Adding Tox init_callbacks")
         def gi_wrapped(iTox, friendid, invite_data, invite_len, *args):
@@ -436,7 +442,16 @@ class SyniTox(Tox):
                 if not self._ssl_context:
                     self.start_ssl(self._oArgs.irc_host)
                 irc = SSL.Connection(self._ssl_context, irc)
-                irc.connect((self._oArgs.irc_host, self._oArgs.irc_port))
+                try:
+                    host = ts.sDNSLookup(self._oArgs.irc_host)
+                except Exception as e:
+                    LOG.warn(f"{self._oArgs.irc_host} errored in resolve {e}")
+                    host = self._oArgs.irc_host
+                else:
+                    if not host:
+                        LOG.warn(f"{self._oArgs.irc_host} did not resolve.")
+                        host = self._oArgs.irc_host
+                irc.connect((host, self._oArgs.irc_port))
                 irc.do_handshake()
                 LOG.info('IRC SSL connected ')
             else:
@@ -453,10 +468,10 @@ class SyniTox(Tox):
             LOG.warn(f"Error: {e}")
             return
 
-        self.irc = irc
-        self.irc.send(bytes('NICK ' + nick + '\r\n', 'UTF-8' ))
-        self.irc.send(bytes('USER %s %s bla :%s\r\n' % (
+        irc.send(bytes('NICK ' + nick + '\r\n', 'UTF-8' ))
+        irc.send(bytes('USER %s %s bla :%s\r\n' % (
             ident, self._oArgs.irc_host, realname), 'UTF-8'))
+        self.irc = irc
 
     def dht_init(self):
         if not self.bRouted(): return
@@ -681,6 +696,7 @@ class SyniTox(Tox):
                 if not dht_conneted:
                     self.dht_init()
                     LOG.info(f'Not DHT connected {iCount} iterating {10 + iDelay} seconds')
+                    iDelay = iDelay + iDelay // 10
                     self.do(10 + iDelay)
                     #drop through
 
@@ -715,23 +731,26 @@ class SyniTox(Tox):
                         self.do(20)
                         continue
 
-                LOG.info('Waiting on IRC.')
-                iDelay = 10
+                LOG.info(f'Waiting on IRC to {self._oArgs.irc_host} on {self._oArgs.irc_port}')
 
                 readable = self.spin(20)
                 if not readable:
                     LOG.info('Waited on IRC but nothing to read.')
+                    iDelay = iDelay + iDelay // 10
                     continue
                 try:
                     self.irc_readlines()
                 except Exception as e:
-                    LOG.exception(f'IRC Error during read: {e}')
+                    LOG.warn(f'IRC Error during read: {e}')
                     # close irc?
-                    try: self.irc.close()
+                    try: 
+                        self.irc.close()
+                        self.irc = None
                     except: pass
-                    self.irc = None
-                    self.irc_init()
                     continue
+                 else:
+                     iDelay = 10
+
                 
         return 0
 
@@ -750,7 +769,6 @@ class SyniTox(Tox):
                 success = True
                 break
             except socket.error:
-                self.irc_init()
                 sleep(1)
 
     def on_connection_status(self, friendId, status):
@@ -859,6 +877,7 @@ def iMain(oArgs, oOpts):
         __builtins__.app = o
         o.start()
         ret = o.iLoop()
+        o.quit()
     except KeyboardInterrupt:
         ret = 0
     except ( SSL.Error, ) as e:
@@ -873,7 +892,6 @@ def iMain(oArgs, oOpts):
         ret = 2
     else:
         ret = 0
-    o.quit()
     return ret
 
 def oToxygenToxOptions(oArgs):
@@ -922,6 +940,7 @@ def oArgparse(lArgv):
             CAcs.append(elt)
             break
 
+    parser.add_argument('--log_level', type=int, default=10)
     parser.add_argument('--bot_name', type=str, default=bot_toxname)
     parser.add_argument('--max_sleep', type=int, default=3600,
                         help="max time to sleep waiting for routing before exiting")
@@ -931,6 +950,7 @@ def oArgparse(lArgv):
 #        parser.add_argument('--irc_type', type=str, default='',
 #                            choices=['', 'startls', 'direct')
     # does host == connect ?
+    # oftcnet6xg6roj6d7id4y4cu6dchysacqj2ldgea73qzdagufflqxrid.onion:6697
     parser.add_argument('--irc_host', type=str, default='irc.oftc.net',
                         help="irc.libera.chat will not work over Tor")
     parser.add_argument('--irc_port', type=int, default=6667,
