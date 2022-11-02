@@ -8,6 +8,7 @@ import re
 import pickle
 import logging
 import ctypes
+import traceback
 
 from time import sleep
 from threading import Thread
@@ -18,6 +19,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import wrapper
+import wrapper_tests
 from wrapper.tox import Tox
 from wrapper.toxav import ToxAV
 import wrapper.toxcore_enums_and_consts as enums
@@ -36,7 +38,7 @@ import wrapper.toxencryptsave as tox_encrypt_save
 
 global LOG
 LOG = logging.getLogger('app.'+'ts')
-
+class SyniToxError(Exception): pass
 
 NAME = 'SyniTox'
 # possible CA locations picks the first one
@@ -60,7 +62,8 @@ def LOG_TRACE(a):
     if bVERBOSE: print('TRAC> '+a)
 
 # https://wiki.python.org/moin/SSL
-def ssl_verify_cb(HOST):
+def ssl_verify_cb(HOST, override=False):
+    assert HOST
     # wrapps host
     def ssl_verify(*args):
         """
@@ -68,6 +71,7 @@ def ssl_verify_cb(HOST):
         should return true if verification passes and false otherwise
         """
         LOG.debug(f"ssl_verify {len(args)} {args}")
+        if override: return True
         ssl_conn, x509, error_num, depth, return_code = args
         if error_num != 0:
             return False
@@ -177,28 +181,38 @@ class SyniTox(Tox):
             with open(self.sMEMORY_DB, 'r') as f:
                 self.memory = pickle.load(f)
 
-        if self._oArgs.irc_ssl != '':
-            self.start_ssl(self._oArgs.irc_host)
-
     def start_ssl(self, HOST):
         if not self._ssl_context:
+            if HOST.endswith('.onion'):
+                override = True
+            else:
+                override = False
             # TLSv1_3_METHOD does not exist
             context = SSL.Context(SSL.TLSv1_2_METHOD)
             context.set_options(SSL.OP_NO_SSLv2|SSL.OP_NO_SSLv3|SSL.OP_NO_TLSv1)
             if self._oArgs.irc_pem:
+                key = self._oArgs.irc_pem
+                assert os.path.exists(key), key
                 val = SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT
                 LOG.info('Using keyfile: %s' % self._oArgs.irc_pem)
-                context.use_privatekey_file(self._oArgs.irc_pem)
+                if False:
+                    context.use_certificate_file(key, filetype=SSL.FILETYPE_PEM)
+                if True:
+                    # key = self._oArgs.irc_pem.replace('.pem', '.key')
+                    assert os.path.exists(key), key
+                    context.use_privatekey_file(key, filetype=SSL.FILETYPE_PEM)
             else:
                 val = SSL.VERIFY_PEER
-            context.set_verify(val, ssl_verify_cb(self._oArgs.irc_host))
+            context.set_verify(val, ssl_verify_cb(HOST, override))
 
             assert os.path.exists(self._oArgs.irc_ca), self._oArgs.irc_ca
             if os.path.isdir(self._oArgs.irc_ca):
                 context.load_verify_locations(capath=self._oArgs.irc_ca)
             else:
                 context.load_verify_locations(cafile=self._oArgs.irc_ca)
-            if self._oArgs.irc_ssl == 'tls1.2':
+            if False:
+                pass
+            elif self._oArgs.irc_ssl == 'tls1.2':
                 context.set_min_proto_version(SSL.TLS1_2_VERSION)
             elif self._oArgs.irc_ssl == 'tls1.3':
                 context.set_min_proto_version(SSL.TLS1_3_VERSION)
@@ -345,30 +359,30 @@ class SyniTox(Tox):
     def init_groups(self):
         LOG.debug(f"init_groups proxy={self._oArgs.proxy_type}")
         group_name = self._oArgs.bot_name +' Test ' +self._oArgs.irc_chan
-        if self.sGROUP_BOT_NUM < 0:
-            # ToDo: look for the first group of the profile
-            i = self.group_get_number_groups()
-            if i == 0:
-                if not self.bRouted(): return False
-                num = self.create_group()
-                self.sGROUP_BOT_NUM = num
-            elif i > 1:
-                LOG.error('There are more than one groups in this profile')
-                for ig in range(i):
-                    LOG.warn(f"group #{ig} {self.group_self_get_name(ig)}")
-                raise RuntimeError("select one of the groups at the cmdline")
-            else:
-                if not self.bRouted(): return False
-                num = self.join_group()
-
-        LOG.info(f"init_groups GROUP_BOT_PK={self.sGROUP_BOT_PK}")
-
-        if self.bRouted():
-            try:
-                self.start_groups()
-            except Exception as e:
-                LOG.warn(f"init_groups self.start_groups {e}")
-                return False
+        if not self.bRouted(): return
+        try:
+            if self.sGROUP_BOT_NUM < 0:
+                # ToDo: look for the first group of the profile
+                i = self.group_get_number_groups()
+                if i == 0:
+                    if not self.bRouted(): return False
+                    num = self.create_group()
+                    self.sGROUP_BOT_NUM = num
+                elif i > 1:
+                    LOG.error('There are more than one groups in this profile')
+                    for ig in range(i):
+                        LOG.warn(f"group #{ig} {self.group_self_get_name(ig)}")
+                    raise RuntimeError("select one of the groups at the cmdline")
+                else:
+                    if not self.bRouted(): return False
+                    num = self.join_group()
+                    
+            LOG.info(f"init_groups GROUP_BOT_PK={self.sGROUP_BOT_PK}")
+        
+            self.start_groups()
+        except Exception as e:
+            LOG.warn(f"init_groups self.start_groups {e}")
+            return False
         # TOX_GROUP_ROLE['FOUNDER']
         return True
 
@@ -431,47 +445,85 @@ class SyniTox(Tox):
                                       self._oArgs.proxy_host,
                                       self._oArgs.proxy_port)
                 irc = socks.socksocket()
+                iTIMEOUT = 15
             elif self._oArgs.proxy_type == 1:
                 socks.setdefaultproxy(socks.PROXY_TYPE_HTTP,
                                       self._oArgs.proxy_host,
                                       self._oArgs.proxy_port)
                 irc = socks.socksocket()
+                iTIMEOUT = 15
             else:
                 irc = socket.socket()
+                iTIMEOUT = 10
+            try:
+                ip = ts.sDNSLookup(self._oArgs.irc_connect)
+            except Exception as e:
+                LOG.warn(f"{self._oArgs.irc_host} errored in resolve {e}")
+                ip = self._oArgs.irc_connect
+            else:
+                if not ip:
+                    LOG.warn(f"{self._oArgs.irc_host} did not resolve.")
+                    ip = self._oArgs.irc_connect
+            # https://github.com/pyca/pyopenssl/issues/168
             if self._oArgs.irc_ssl:
                 if not self._ssl_context:
-                    self.start_ssl(self._oArgs.irc_host)
+                    self.start_ssl(self._oArgs.irc_connect)
                 irc = SSL.Connection(self._ssl_context, irc)
-                try:
-                    host = ts.sDNSLookup(self._oArgs.irc_host)
-                except Exception as e:
-                    LOG.warn(f"{self._oArgs.irc_host} errored in resolve {e}")
-                    host = self._oArgs.irc_host
+                irc.connect((ip, self._oArgs.irc_port))
+                if ip.endswith('.onion'):
+                    irc.set_tlsext_host_name(None)
                 else:
-                    if not host:
-                        LOG.warn(f"{self._oArgs.irc_host} did not resolve.")
-                        host = self._oArgs.irc_host
-                irc.connect((host, self._oArgs.irc_port))
-                irc.do_handshake()
-                LOG.info('IRC SSL connected ')
+                    irc.set_tlsext_host_name(bytes(self._oArgs.irc_host, 'UTF-8'))
+                irc.set_connect_state()
+                while True:
+                    try:
+                        irc.do_handshake()
+                    except SSl.WantReadError:
+                        rd,_,_ = select.select([irc], [], [], irc.gettimeout())
+                        if not rd:
+                            raise socket.timeout('timeout')
+                        continue
+                    except SSl.Error as e:
+                        raise
+                    break
+                for cert in irc.get_peer_cert_chain():
+                    print(f"{cert.get_subject} {cert.get_issuer}")
             else:
-                irc.connect((self._oArgs.irc_host, self._oArgs.irc_port))
-                LOG.info('IRC connected ')
-                
+                irc.connect((ip, self._oArgs.irc_port))
+            LOG.info(f"IRC {'SSL ' if self._oArgs.irc_ssl else ''} connected ")
+
+        except wrapper_tests.socks.Socks5Error as e:
+            if len(e.args[0]) == 2 and e.args[0][0] ==2:
+                LOG.warn(f"Socks5Error: do you have Tor SafeSocks set? {e.args[0]}")
+                return
+            else:
+                LOG.error(f"Socks5Error: {e.args}")
+                raise SyniToxError(f"{e.args}")
+        except socket.timeout as e:
+            LOG.warn(f"socket error: {e.args}")
+            return
         except ( SSL.Error, ) as e:
             LOG.warn(f"SSL error: {e.args}")
             return
         except (SSL.SysCallError,  ) as e:
-            LOG.warn(f"SSL error: {e.args}")
+            LOG.warn(f"SSLSyscall error: {e.args}")
+            LOG.warn(traceback.format_exc())
             return
+        except wrapper_tests.socks.Socks5Error as e:
+            # (2, 'connection not allowed by ruleset')
+            raise
         except Exception as e:
             LOG.warn(f"Error: {e}")
+            LOG.warn(traceback.format_exc())
             return
 
-        irc.send(bytes('NICK ' + nick + '\r\n', 'UTF-8' ))
-        irc.send(bytes('USER %s %s bla :%s\r\n' % (
-            ident, self._oArgs.irc_host, realname), 'UTF-8'))
         self.irc = irc
+        if not self._oArgs.irc_ssl:
+            self.irc.send(bytes('NICK ' + nick + '\r\n', 'UTF-8' ))
+            self.irc.send(bytes('USER %s %s bla :%s\r\n' % (
+                          self._oArgs.irc_ident,
+                          self._oArgs.irc_host,
+                          self._oArgs.irc_name), 'UTF-8'))
 
     def dht_init(self):
         if not self.bRouted(): return
@@ -489,7 +541,7 @@ class SyniTox(Tox):
                 self.test_net()
             lNodes = self._settings['current_nodes_tcp']
             shuffle(lNodes)
-            LOG.info(f'TCP bootstapping 6')
+            LOG.debug(f'TCP bootstapping 6')
             ts.bootstrap_tcp(lNodes[:6], [self])
 
     def get_all_groups(self):
@@ -566,9 +618,9 @@ class SyniTox(Tox):
             for line in lines[:5]:
                 line = str(line, 'UTF-8').strip().lower()
                 if 'banned' in line:
-                    raise RuntimeError(line)
+                    raise SyniToxError(line)
                 if 'error' in line and 'closing' in line:
-                    raise RuntimeError(line)
+                    raise SyniToxError(line)
 
     def irc_readlines(self):
         nick = self._oArgs.irc_nick
@@ -598,18 +650,29 @@ class SyniTox(Tox):
                self.irc_send('PONG %s\r\n' % l[1])
             elif len(l) < 2:
                 pass
-            elif l[1] == '376':
+            elif l[1] in ['461', '431']:
+                pass
+            elif l[1] in ['433', '462', '477']:
+                if self._oArgs.irc_ssl:
+                    LOG.warn("Maybe the certificate was not received")
+                raise SyniToxError(line)
+            elif l[1] in ['376']:
                 # :End of /MOTD command
-                if email == '':
-                    self.irc.send(bytes('PRIVMSG NickServ IDENTIFY %s %s\r\n'
+                if self._oArgs.irc_ssl != '':
+                    pass
+                elif email == '' and pwd:
+                    LOG.info(bytes('PRIVMSG NickServ IDENTIFY %s %s\r\n'
                             % (nick, pwd,), 'UTF-8'))
-                else:
+                    self.irc.send(bytes('PRIVMSG NickServ IDENTIFY %s %s\r\n'
+                                        % (nick, pwd,), 'UTF-8'))
+                elif email != '' and pwd:
+                    LOG.info(bytes('PRIVMSG NickServ REGISTER %s %s\r\n'
+                                   % (pwd, email,), 'UTF-8'))
                     self.irc.send(bytes('PRIVMSG NickServ REGISTER %s %s\r\n'
                             % (pwd, email,), 'UTF-8'))
-                if False and fp:
-                    LOG.info(f"PRIVMSG NickServ CERT ADD")
-#                               self.irc.send(bytes(f'PRIVMSG NickServ CERT ADD {fp}\r\n', 'UTF-8'))
-                #
+                else:
+                    LOG.error("you must provide a password to register")
+                    raise RuntimeError("you must provide a password to register")
                 self.irc.send(bytes('JOIN %s\r\n' % self._oArgs.irc_chan, 'UTF-8'))
                 # put off init_groups until you have joined IRC
                 self.init_groups()
@@ -651,14 +714,15 @@ class SyniTox(Tox):
         if content.startswith('^'):
             self.handle_command(content)
 
-    def spin(self, n=20):
+    def spin(self, n=20, iMax=1000):
         readable = False
         waiti = 0
         while not readable:
             waiti += 1
-            readable, _, _ = select.select([self.irc], [], [], n/1000.0 )
+            readable, _, _ = select.select([self.irc], [], [], n/100.0 )
+            if readable and len(readable) and readable[0]: return readable
             self.do(n)
-            if waiti > 100: break
+            if waiti > iMax: break
         return readable
 
     def iLoop(self):
@@ -670,6 +734,8 @@ class SyniTox(Tox):
         iDelay = 10
         
         nick = self._oArgs.irc_nick
+        realname = self._oArgs.irc_name
+        ident = self._oArgs.irc_ident
         pwd = self._oArgs.irc_pass
         email = self._oArgs.irc_email
         LOG.info(f"Looping for Tox and IRC connections")
@@ -697,7 +763,7 @@ class SyniTox(Tox):
                     self.dht_init()
                     LOG.info(f'Not DHT connected {iCount} iterating {10 + iDelay} seconds')
                     iDelay = iDelay + iDelay // 10
-                    self.do(10 + iDelay)
+                    self.do(iDelay)
                     #drop through
 
                 if not group_connected and dht_conneted:
@@ -725,32 +791,38 @@ class SyniTox(Tox):
                     group_connected = False
 
                 if not self.irc:
-                    LOG.info('Disconnected from IRC.')
                     self.irc_init()
                     if not self.irc:
                         self.do(20)
                         continue
 
+ 
                 LOG.info(f'Waiting on IRC to {self._oArgs.irc_host} on {self._oArgs.irc_port}')
 
                 readable = self.spin(20)
-                if not readable:
+                if not readable or not readable[0]:
                     LOG.info('Waited on IRC but nothing to read.')
                     iDelay = iDelay + iDelay // 10
                     continue
                 try:
-                    self.irc_readlines()
+                    pass
                 except Exception as e:
-                    LOG.warn(f'IRC Error during read: {e}')
-                    # close irc?
-                    try: 
-                        self.irc.close()
-                        self.irc = None
-                    except: pass
-                    continue
-                 else:
-                     iDelay = 10
+                    if len(e.args) > 1 and e.args[0] == 32:
+                        raise
+                    elif f"{e}" != "2":
+                        LOG.warn(f'IRC Error during read: {e}')
+                        # close irc?
+                        try: 
+                            self.irc.close()
+                            self.irc = None
+                        except: pass
+                        continue
+                    else:
+                        iDelay = 10
+                else:
+                    iDelay = 10
 
+                self.irc_readlines()
                 
         return 0
 
@@ -887,9 +959,12 @@ def iMain(oArgs, oOpts):
         # OpenSSL.SSL.SysCallError: (9, 'EBADF')
         LOG.error(f"SSL error: {e.args}")
         ret = 1
+    except SyniToxError as e:
+        LOG.error(f'Error running program:\n{e}')
+        ret = 2
     except Exception as e:
         LOG.exception(f'Error running program:\n{e}')
-        ret = 2
+        ret = 3
     else:
         ret = 0
     return ret
@@ -951,8 +1026,11 @@ def oArgparse(lArgv):
 #                            choices=['', 'startls', 'direct')
     # does host == connect ?
     # oftcnet6xg6roj6d7id4y4cu6dchysacqj2ldgea73qzdagufflqxrid.onion:6697
-    parser.add_argument('--irc_host', type=str, default='irc.oftc.net',
+    # irc.oftc.net
+    parser.add_argument('--irc_host', type=str, default='',
                         help="irc.libera.chat will not work over Tor")
+    parser.add_argument('--irc_connect', type=str, default='',
+                        help="defaults to irc_host")
     parser.add_argument('--irc_port', type=int, default=6667,
                         help="default 6667, but may be 6697 with SSL")
     parser.add_argument('--irc_chan', type=str, default='#tor',
@@ -1019,6 +1097,9 @@ def main(lArgs=None):
     if lArgs is None: lArgs = []
     global     oTOX_OARGS
     oTOX_OARGS = oArgparse(lArgs)
+    assert oTOX_OARGS.irc_host or oTOX_OARGS.irc_connect
+    if not oTOX_OARGS.irc_connect:
+        oTOX_OARGS.irc_connect = oTOX_OARGS.irc_host
     global oTOX_OPTIONS
     oTOX_OPTIONS = oToxygenToxOptions(oTOX_OARGS)
     ts.vSetupLogging(oTOX_OARGS)
