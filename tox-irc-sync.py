@@ -13,6 +13,7 @@ import traceback
 from time import sleep
 from threading import Thread
 from random import shuffle
+from errno import errorcode
 from OpenSSL import SSL
 
 import warnings
@@ -38,15 +39,42 @@ import wrapper.toxencryptsave as tox_encrypt_save
 
 global LOG
 LOG = logging.getLogger('app.'+'ts')
-class SyniToxError(Exception): pass
+class SyniToxError(BaseException): pass
 
 NAME = 'SyniTox'
+SSL_TOR_RANGE = '172.'
 # possible CA locations picks the first one
-lCAs = ['/etc/ssl/cacert.pem',
-        # debian
-        '/etc/ssl/certs/']
-
+lCAs = [# debian and gentoo
+        '/etc/ssl/certs/',
+    ]
+lCAfs = SSL._CERTIFICATE_FILE_LOCATIONS
+# openssl ciphers -s -v|grep 1.3 > /tmp/v1.3
+lOPENSSL_13_CIPHERS = ['TLS_AES_256_GCM_SHA384',
+                       'TLS_CHACHA20_POLY1305_SHA256',
+                       'TLS_AES_128_GCM_SHA256']
+lOPENSSL_12_CIPHERS = ['ECDHE-ECDSA-AES256-GCM-SHA384',
+                       'ECDHE-RSA-AES256-GCM-SHA384',
+                       'DHE-RSA-AES256-GCM-SHA384',
+                       'ECDHE-ECDSA-CHACHA20-POLY1305',
+                       'ECDHE-RSA-CHACHA20-POLY1305',
+                       'DHE-RSA-CHACHA20-POLY1305',
+                       'ECDHE-ECDSA-AES128-GCM-SHA256',
+                       'ECDHE-RSA-AES128-GCM-SHA256',
+                       'DHE-RSA-AES128-GCM-SHA256',
+                       'ECDHE-ECDSA-AES256-SHA384',
+                       'ECDHE-RSA-AES256-SHA384',
+                       'DHE-RSA-AES256-SHA256',
+                       'ECDHE-ECDSA-AES128-SHA256',
+                       'ECDHE-RSA-AES128-SHA256',
+                       'DHE-RSA-AES128-SHA256',
+                       'AES256-GCM-SHA384',
+                       'AES128-GCM-SHA256',
+                       'AES256-SHA256',
+                       'AES128-SHA256'
+                       ]
 bot_toxname = 'SyniTox'
+iSocks5ErrorMax = 5
+iSocks5Error = 0
 
 # tox.py can be called by callbacks
 def LOG_ERROR(a): print('EROR> '+a)
@@ -62,8 +90,8 @@ def LOG_TRACE(a):
     if bVERBOSE: print('TRAC> '+a)
 
 # https://wiki.python.org/moin/SSL
-def ssl_verify_cb(HOST, override=False):
-    assert HOST
+def ssl_verify_cb(host, override=False):
+    assert host
     # wrapps host
     def ssl_verify(*args):
         """
@@ -71,28 +99,33 @@ def ssl_verify_cb(HOST, override=False):
         should return true if verification passes and false otherwise
         """
         LOG.debug(f"ssl_verify {len(args)} {args}")
+
+        # app.ts WARNING SSL error: ([('SSL routines', 'tls_process_server_certificate', 'certificate verify failed')],)                                              # on .onion - fair enough    
         if override: return True
+        
         ssl_conn, x509, error_num, depth, return_code = args
         if error_num != 0:
+            LOG.warn(f"ssl_verify error_num={error_num} {errorcode.get(error_num)}")
             return False
         if depth != 0:
             # don't validate names of root certificates
             return True
 
-        if x509.get_subject().commonName == HOST:
+        if x509.get_subject().commonName == host:
             return True
 
-        LOG.warn(f"ssl_verify {x509.get_subject().commonName} {HOST}")
         # allow matching subdomains
-        have , want = x509.get_subject().commonName, HOST
+        have , want = x509.get_subject().commonName, host
         if len(have.split('.')) == len(want.split('.')) and len(want.split('.')) > 2:
             if have.split('.')[1:] == want.split('.')[1:]:
+                LOG.warn(f"ssl_verify accepting {x509.get_subject().commonName} for {host}")
                 return True
 
         return False
 
     return ssl_verify
 
+    
 class SyniTox(Tox):
 
     def __init__(self,
@@ -183,38 +216,61 @@ class SyniTox(Tox):
 
     def start_ssl(self, HOST):
         if not self._ssl_context:
-            if HOST.endswith('.onion'):
+            try:
+                OP_NO_TLSv1_3 = SSL._lib.SSL_OP_NO_TLSv1_3
+            except AttributeError:
+                if self._oArgs.irc_ssl == 'tlsv1.3':
+                    LOG.warning("SSL._lib.SSL_OP_NO_TLSv1_3 is not supported")
+                    LOG.warning("Downgrading SSL to tlsv1.2 ")
+                    self._oArgs.irc_ssl = 'tlsv1.2'
+                else:
+                    LOG.debug("SSL._lib.SSL_OP_NO_TLSv1_3 is not supported")
+            else:
+                LOG.debug("SSL._lib.SSL_OP_NO_TLSv1_3 is supported")
+                    
+            if self._oArgs.irc_connect.endswith('.onion') or \
+                self._oArgs.irc_connect.startswith(SSL_TOR_RANGE):
                 override = True
             else:
                 override = False
             # TLSv1_3_METHOD does not exist
             context = SSL.Context(SSL.TLSv1_2_METHOD)
+            # SSL.OP_NO_TLSv1_1 is allowed
             context.set_options(SSL.OP_NO_SSLv2|SSL.OP_NO_SSLv3|SSL.OP_NO_TLSv1)
+            # this maybe necessary even for a 1.3 site to get the handshake
+            # in pyOpenSSL - or was it a protocol downgrade attack?
+#?            context.set_cipher_list("DEFAULT:SECLEVEL=1")
+            # im getting  SSL error: ([('SSL routines', 'tls_construct_client_hello', 'no protocols available')],)
+            # if I use tlsv1.3 or tlsv1.2 without this on a tlsv1.3 capacble site
+            
             if self._oArgs.irc_pem:
                 key = self._oArgs.irc_pem
                 assert os.path.exists(key), key
                 val = SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT
                 LOG.info('Using keyfile: %s' % self._oArgs.irc_pem)
-                if False:
+                if True:
+                    key = self._oArgs.irc_pem.replace('.pem', '.crt')
                     context.use_certificate_file(key, filetype=SSL.FILETYPE_PEM)
                 if True:
-                    # key = self._oArgs.irc_pem.replace('.pem', '.key')
+                    key = self._oArgs.irc_pem.replace('.pem', '.key')
                     assert os.path.exists(key), key
                     context.use_privatekey_file(key, filetype=SSL.FILETYPE_PEM)
             else:
                 val = SSL.VERIFY_PEER
             context.set_verify(val, ssl_verify_cb(HOST, override))
 
-            assert os.path.exists(self._oArgs.irc_ca), self._oArgs.irc_ca
-            if os.path.isdir(self._oArgs.irc_ca):
-                context.load_verify_locations(capath=self._oArgs.irc_ca)
-            else:
-                context.load_verify_locations(cafile=self._oArgs.irc_ca)
-            if False:
-                pass
-            elif self._oArgs.irc_ssl == 'tls1.2':
+            if self._oArgs.irc_cafile:
+                # context.load_verify_locations(capath=self._oArgs.irc_ca)
+                context.load_verify_locations(self._oArgs.irc_cafile, capath=self._oArgs.irc_cadir)
+            elif self._oArgs.irc_cadir:
+                context.load_verify_locations(None, capath=self._oArgs.irc_cadir)
+            if self._oArgs.irc_ssl == 'tlsv1.1':
+                context.set_min_proto_version(SSL.TLS1_1_VERSION)
+            elif self._oArgs.irc_ssl == 'tlsv1.2':
+                context.set_cipher_list(bytes(' '.join(lOPENSSL_12_CIPHERS), 'UTF-8'))
                 context.set_min_proto_version(SSL.TLS1_2_VERSION)
-            elif self._oArgs.irc_ssl == 'tls1.3':
+            elif self._oArgs.irc_ssl == 'tlsv1.3':
+#?                context.set_cipher_list(bytes(' '.join(lOPENSSL_13_CIPHERS), 'UTF-8'))                
                 context.set_min_proto_version(SSL.TLS1_3_VERSION)
             self._ssl_context = context
             
@@ -432,13 +488,35 @@ class SyniTox(Tox):
         self.callback_friend_request(None)
         self.callback_friend_request(None)
 
+    def diagnose_ciphers(self, irc):
+        cipher_name = irc.get_cipher_name()
+        LOG.info(f"cipher_name={irc.get_cipher_name()}")
+        LOG.debug(f"get_cipher_list={irc.get_cipher_list()}")
+        cipher_list=irc.get_cipher_list()
+        for ci in lOPENSSL_13_CIPHERS:
+            if ci in cipher_list: LOG.info(f"server supports v1.3 cipher {ci}")
+        cipher_name = irc.get_cipher_name()
+        LOG.info(f"cipher_name={irc.get_cipher_name()}")
+        if self._oArgs.irc_ssl == 'tlsv1.2':
+            assert cipher_name in lOPENSSL_12_CIPHERS, cipher_name
+        elif self._oArgs.irc_ssl == 'tlsv1.3':
+            assert cipher_name in lOPENSSL_13_CIPHERS, cipher_name
+
+        for cert in irc.get_peer_cert_chain():
+            # x509 objects - just want the /CN
+            LOG.debug(f"{cert.get_subject()} {cert.get_issuer()}")
+        assert irc.get_protocol_version_name().lower() == \
+            self._oArgs.irc_ssl, \
+            irc.get_protocol_version_name().lower()
+
     def irc_init(self):
+        global iSocks5Error
+        
         if not self.bRouted(): return
         nick = self._oArgs.irc_nick
         realname = self._oArgs.irc_name
         ident = self._oArgs.irc_ident
-
-        LOG.info(f"irc_init proxy={self._oArgs.proxy_type}")
+        LOG.info(f"irc_init proxy={self._oArgs.proxy_type} SSL={self._oArgs.irc_ssl}")
         try:
             if self._oArgs.proxy_type == 2:
                 socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5,
@@ -474,27 +552,37 @@ class SyniTox(Tox):
                     irc.set_tlsext_host_name(None)
                 else:
                     irc.set_tlsext_host_name(bytes(self._oArgs.irc_host, 'UTF-8'))
-                irc.set_connect_state()
+#?                irc.set_connect_state()
                 while True:
                     try:
                         irc.do_handshake()
-                    except SSl.WantReadError:
+                    except SSL.WantReadError:
                         rd,_,_ = select.select([irc], [], [], irc.gettimeout())
                         if not rd:
                             raise socket.timeout('timeout')
                         continue
-                    except SSl.Error as e:
+                    except SSL.Error as e:
                         raise
                     break
-                for cert in irc.get_peer_cert_chain():
-                    print(f"{cert.get_subject} {cert.get_issuer}")
+                self.diagnose_ciphers(irc)
             else:
                 irc.connect((ip, self._oArgs.irc_port))
             LOG.info(f"IRC {'SSL ' if self._oArgs.irc_ssl else ''} connected ")
 
         except wrapper_tests.socks.Socks5Error as e:
-            if len(e.args[0]) == 2 and e.args[0][0] ==2:
+            iSocks5Error += 1
+            if iSocks5Error >= iSocks5ErrorMax:
+                raise SyniToxError(f"{e.args}")
+            if len(e.args[0]) == 2 and e.args[0][0] == 2:
                 LOG.warn(f"Socks5Error: do you have Tor SafeSocks set? {e.args[0]}")
+            elif len(e.args[0]) == 2 and e.args[0][0] == 5:
+                # (5, 'Connection refused')
+                LOG.warn(f"Socks5Error: do you have Tor running? {e.args[0]}")
+                raise SyniToxError(f"{e.args}")
+            elif len(e.args[0]) == 2 and e.args[0][0] in [1, 6]:
+                # (6, 'TTL expired'), 1, ('general SOCKS server failure')
+                # Missing mapping for virtual address '172.17.140.117'. Refusing.
+                LOG.warn(f"Socks5Error: {e.args[0]}")
                 return
             else:
                 LOG.error(f"Socks5Error: {e.args}")
@@ -502,16 +590,18 @@ class SyniTox(Tox):
         except socket.timeout as e:
             LOG.warn(f"socket error: {e.args}")
             return
+        except ( ConnectionRefusedError) as e:
+            raise SyniToxError(f"{e.args}")
         except ( SSL.Error, ) as e:
+            iSocks5Error += 1
+            if iSocks5Error >= iSocks5ErrorMax:
+                raise SyniToxError(f"{e.args}")
             LOG.warn(f"SSL error: {e.args}")
             return
         except (SSL.SysCallError,  ) as e:
             LOG.warn(f"SSLSyscall error: {e.args}")
             LOG.warn(traceback.format_exc())
             return
-        except wrapper_tests.socks.Socks5Error as e:
-            # (2, 'connection not allowed by ruleset')
-            raise
         except Exception as e:
             LOG.warn(f"Error: {e}")
             LOG.warn(traceback.format_exc())
@@ -524,7 +614,8 @@ class SyniTox(Tox):
                           self._oArgs.irc_ident,
                           self._oArgs.irc_host,
                           self._oArgs.irc_name), 'UTF-8'))
-
+         # OSError: [Errno 9] Bad file descriptor
+         
     def dht_init(self):
         if not self.bRouted(): return
         if 'current_nodes_udp' not in self._settings:
@@ -673,7 +764,11 @@ class SyniTox(Tox):
                 else:
                     LOG.error("you must provide a password to register")
                     raise RuntimeError("you must provide a password to register")
-                self.irc.send(bytes('JOIN %s\r\n' % self._oArgs.irc_chan, 'UTF-8'))
+                try:                
+                    self.irc.send(bytes('JOIN %s\r\n' % self._oArgs.irc_chan, 'UTF-8'))
+                except BrokenPipeError:
+                    raise SyniToxError('BrokenPipeError')
+                    
                 # put off init_groups until you have joined IRC
                 self.init_groups()
                 # Make sure we are in
@@ -1013,7 +1108,10 @@ def oArgparse(lArgv):
     for elt in lCAs:
         if os.path.exists(elt):
             CAcs.append(elt)
-            break
+    CAfs = []
+    for elt in lCAfs:
+        if os.path.exists(elt):
+            CAfs.append(elt)
 
     parser.add_argument('--log_level', type=int, default=10)
     parser.add_argument('--bot_name', type=str, default=bot_toxname)
@@ -1038,9 +1136,12 @@ def oArgparse(lArgv):
     #
     parser.add_argument('--irc_ssl', type=str, default='',
                         help="TLS version; empty is no SSL",
-                        choices=['', 'tls1.2', 'tls1.3'])
-    parser.add_argument('--irc_ca', type=str,
-                        help="Certificate Authority file or directory",
+                        choices=['', 'tlsv1.1', 'tlsv1.2', 'tlsv1.3'])
+    parser.add_argument('--irc_cafile', type=str,
+                        help="Certificate Authority file",
+                        default=CAfs[0])
+    parser.add_argument('--irc_cadir', type=str,
+                        help="Certificate Authority directory",
                         default=CAcs[0])
     parser.add_argument('--irc_pem', type=str, default='',
                         help="Certificate and key as pem; use openssl req -x509 -nodes -newkey rsa:2048")
@@ -1100,6 +1201,10 @@ def main(lArgs=None):
     assert oTOX_OARGS.irc_host or oTOX_OARGS.irc_connect
     if not oTOX_OARGS.irc_connect:
         oTOX_OARGS.irc_connect = oTOX_OARGS.irc_host
+    if oTOX_OARGS.irc_cadir:
+        assert os.path.isdir(oTOX_OARGS.irc_cadir)
+    if oTOX_OARGS.irc_cafile:
+        assert os.path.isfile(oTOX_OARGS.irc_cafile)
     global oTOX_OPTIONS
     oTOX_OPTIONS = oToxygenToxOptions(oTOX_OARGS)
     ts.vSetupLogging(oTOX_OARGS)
