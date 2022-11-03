@@ -234,7 +234,7 @@ class SyniTox(Tox):
             else:
                 override = False
             # TLSv1_3_METHOD does not exist
-            context = SSL.Context(SSL.TLSv1_2_METHOD)
+            context = SSL.Context(SSL.TLS_CLIENT_METHOD) # TLSv1_2_METHOD
             # SSL.OP_NO_TLSv1_1 is allowed
             context.set_options(SSL.OP_NO_SSLv2|SSL.OP_NO_SSLv3|SSL.OP_NO_TLSv1)
             # this maybe necessary even for a 1.3 site to get the handshake
@@ -249,12 +249,22 @@ class SyniTox(Tox):
                 val = SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT
                 LOG.info('Using keyfile: %s' % self._oArgs.irc_pem)
                 if True:
-                    key = self._oArgs.irc_pem.replace('.pem', '.crt')
+                    # key = self._oArgs.irc_pem.replace('.pem', '.crt')
+                    assert os.path.exists(key), key
                     context.use_certificate_file(key, filetype=SSL.FILETYPE_PEM)
                 if True:
-                    key = self._oArgs.irc_pem.replace('.pem', '.key')
+                    # key = self._oArgs.irc_pem.replace('.pem', '.key')
                     assert os.path.exists(key), key
                     context.use_privatekey_file(key, filetype=SSL.FILETYPE_PEM)
+                #? load_client_ca
+                def SSL_hands_cb(oConn,iLine,iRet):
+                    # where in the SSL handshake the function was called, and
+                    # the return code from a internal function call
+                    print(f"iLine={iLine}, iRet={iRet}")
+                # context.set_info_callback(SSL_hands_cb)
+                def keylog_callback(oConn,s):
+                    print(s)
+                context.set_keylog_callback(keylog_callback)
             else:
                 val = SSL.VERIFY_PEER
             context.set_verify(val, ssl_verify_cb(HOST, override))
@@ -267,10 +277,10 @@ class SyniTox(Tox):
             if self._oArgs.irc_ssl == 'tlsv1.1':
                 context.set_min_proto_version(SSL.TLS1_1_VERSION)
             elif self._oArgs.irc_ssl == 'tlsv1.2':
-                context.set_cipher_list(bytes(' '.join(lOPENSSL_12_CIPHERS), 'UTF-8'))
+                context.set_cipher_list(bytes(':'.join(['DEFAULT@SECLEVEL=1']+lOPENSSL_12_CIPHERS), 'UTF-8'))
                 context.set_min_proto_version(SSL.TLS1_2_VERSION)
             elif self._oArgs.irc_ssl == 'tlsv1.3':
-#?                context.set_cipher_list(bytes(' '.join(lOPENSSL_13_CIPHERS), 'UTF-8'))                
+                context.set_cipher_list(bytes(':'.join(['DEFAULT@SECLEVEL=1']+lOPENSSL_13_CIPHERS), 'UTF-8'))                
                 context.set_min_proto_version(SSL.TLS1_3_VERSION)
             self._ssl_context = context
             
@@ -567,7 +577,7 @@ class SyniTox(Tox):
                 self.diagnose_ciphers(irc)
             else:
                 irc.connect((ip, self._oArgs.irc_port))
-            LOG.info(f"IRC {'SSL ' if self._oArgs.irc_ssl else ''} connected ")
+            LOG.info(f"IRC SSL={self._oArgs.irc_ssl} connected ")
 
         except wrapper_tests.socks.Socks5Error as e:
             iSocks5Error += 1
@@ -614,6 +624,7 @@ class SyniTox(Tox):
                           self._oArgs.irc_ident,
                           self._oArgs.irc_host,
                           self._oArgs.irc_name), 'UTF-8'))
+
          # OSError: [Errno 9] Bad file descriptor
          
     def dht_init(self):
@@ -732,7 +743,8 @@ class SyniTox(Tox):
             elif l[1] not in ['372']:
                 i = line.find(' ')
                 print(line[i+1:])
-
+            else:
+                LOG.info('MOTD')
             rx = re.match(r':(.*?)!.*? PRIVMSG %s :(.*?)\r' %
                     self._oArgs.irc_chan, line, re.S)
             if rx:
