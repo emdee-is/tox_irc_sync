@@ -42,6 +42,7 @@ LOG = logging.getLogger('app.'+'ts')
 class SyniToxError(BaseException): pass
 
 NAME = 'SyniTox'
+sMSG = 'MSG'
 SSL_TOR_RANGE = '172.'
 # possible CA locations picks the first one
 lCAs = [# debian and gentoo
@@ -237,23 +238,17 @@ class SyniTox(Tox):
             context = SSL.Context(SSL.TLS_CLIENT_METHOD) # TLSv1_2_METHOD
             # SSL.OP_NO_TLSv1_1 is allowed
             context.set_options(SSL.OP_NO_SSLv2|SSL.OP_NO_SSLv3|SSL.OP_NO_TLSv1)
-            # this maybe necessary even for a 1.3 site to get the handshake
-            # in pyOpenSSL - or was it a protocol downgrade attack?
-#?            context.set_cipher_list("DEFAULT:SECLEVEL=1")
-            # im getting  SSL error: ([('SSL routines', 'tls_construct_client_hello', 'no protocols available')],)
-            # if I use tlsv1.3 or tlsv1.2 without this on a tlsv1.3 capacble site
             
-            if self._oArgs.irc_pem:
-                key = self._oArgs.irc_pem
+            if self._oArgs.irc_crt and self._oArgs.irc_key:
                 assert os.path.exists(key), key
                 val = SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT
-                LOG.info('Using keyfile: %s' % self._oArgs.irc_pem)
-                if True:
-                    # key = self._oArgs.irc_pem.replace('.pem', '.crt')
+                LOG.info('Using keyfile: %s' % key)
+                if True: # required!
+                    key = self._oArgs.irc_crt
                     assert os.path.exists(key), key
                     context.use_certificate_file(key, filetype=SSL.FILETYPE_PEM)
-                if True:
-                    # key = self._oArgs.irc_pem.replace('.pem', '.key')
+                if True: # required!
+                    key = self._oArgs.irc_key
                     assert os.path.exists(key), key
                     context.use_privatekey_file(key, filetype=SSL.FILETYPE_PEM)
                 #? load_client_ca
@@ -261,10 +256,10 @@ class SyniTox(Tox):
                     # where in the SSL handshake the function was called, and
                     # the return code from a internal function call
                     print(f"iLine={iLine}, iRet={iRet}")
-                # context.set_info_callback(SSL_hands_cb)
+                context.set_info_callback(SSL_hands_cb)
                 def keylog_callback(oConn,s):
                     print(s)
-                context.set_keylog_callback(keylog_callback)
+                # context.set_keylog_callback(keylog_callback)
             else:
                 val = SSL.VERIFY_PEER
             context.set_verify(val, ssl_verify_cb(HOST, override))
@@ -305,7 +300,7 @@ class SyniTox(Tox):
         lNodes = ts.generate_nodes(oArgs=self._oArgs,
                                    ipv='ipv4',
                                    udp_not_tcp=True)
-        self._settings['current_nodes_udp'] = ts.sDNSClean(lNodes)
+        self._settings['current_nodes_udp'] = ts.lDNSClean(lNodes)
         if not lNodes:
             LOG.warn('empty generate_nodes udp')
         else:
@@ -314,7 +309,7 @@ class SyniTox(Tox):
         lNodes = ts.generate_nodes(oArgs=self._oArgs,
                                    ipv='ipv4',
                                    udp_not_tcp=False)
-        self._settings['current_nodes_tcp'] = ts.sDNSClean(lNodes)
+        self._settings['current_nodes_tcp'] = ts.lDNSClean(lNodes)
         if not lNodes:
             LOG.warn('empty generate_nodes tcp')
         else:
@@ -500,25 +495,29 @@ class SyniTox(Tox):
 
     def diagnose_ciphers(self, irc):
         cipher_name = irc.get_cipher_name()
-        LOG.info(f"cipher_name={irc.get_cipher_name()}")
-        LOG.debug(f"get_cipher_list={irc.get_cipher_list()}")
+        LOG.info(f"diagnose_ciphers cipher_name={irc.get_cipher_name()}")
+        LOG.debug(f"diagnose_ciphers get_cipher_list={irc.get_cipher_list()}")
         cipher_list=irc.get_cipher_list()
         for ci in lOPENSSL_13_CIPHERS:
-            if ci in cipher_list: LOG.info(f"server supports v1.3 cipher {ci}")
+            if ci in cipher_list: LOG.debug(f"server supports v1.3 cipher {ci}")
+        for cert in irc.get_peer_cert_chain():
+            # x509 objects - just want the /CN
+            LOG.debug(f"{cert.get_subject().CN} {cert.get_issuer()}")
+
         cipher_name = irc.get_cipher_name()
-        LOG.info(f"cipher_name={irc.get_cipher_name()}")
         if self._oArgs.irc_ssl == 'tlsv1.2':
-            assert cipher_name in lOPENSSL_12_CIPHERS, cipher_name
+            assert cipher_name in lOPENSSL_12_CIPHERS or \
+                 cipher_name in lOPENSSL_13_CIPHERS, cipher_name
         elif self._oArgs.irc_ssl == 'tlsv1.3':
             assert cipher_name in lOPENSSL_13_CIPHERS, cipher_name
 
-        for cert in irc.get_peer_cert_chain():
-            # x509 objects - just want the /CN
-            LOG.debug(f"{cert.get_subject()} {cert.get_issuer()}")
-        assert irc.get_protocol_version_name().lower() == \
-            self._oArgs.irc_ssl, \
-            irc.get_protocol_version_name().lower()
-
+        got = irc.get_protocol_version_name().lower()
+        if got > self._oArgs.irc_ssl:
+            LOG.debug(f"Got: {irc.get_protocol_version_name().lower()} asked for {self._oArgs.irc_ssl}")
+        elif got < self._oArgs.irc_ssl:
+            LOG.warn(f"Got: {irc.get_protocol_version_name().lower()} asked for {self._oArgs.irc_ssl}")
+        LOG.info(f"diagnose_ciphers {str(irc.get_state_string(), 'UTF-8')}")
+        
     def irc_init(self):
         global iSocks5Error
         
@@ -562,7 +561,6 @@ class SyniTox(Tox):
                     irc.set_tlsext_host_name(None)
                 else:
                     irc.set_tlsext_host_name(bytes(self._oArgs.irc_host, 'UTF-8'))
-#?                irc.set_connect_state()
                 while True:
                     try:
                         irc.do_handshake()
@@ -579,21 +577,24 @@ class SyniTox(Tox):
                 irc.connect((ip, self._oArgs.irc_port))
             LOG.info(f"IRC SSL={self._oArgs.irc_ssl} connected ")
 
-        except wrapper_tests.socks.Socks5Error as e:
+        except (wrapper_tests.socks.GeneralProxyError, wrapper_tests.socks.Socks5Error) as e:
             iSocks5Error += 1
             if iSocks5Error >= iSocks5ErrorMax:
                 raise SyniToxError(f"{e.args}")
-            if len(e.args[0]) == 2 and e.args[0][0] == 2:
-                LOG.warn(f"Socks5Error: do you have Tor SafeSocks set? {e.args[0]}")
-            elif len(e.args[0]) == 2 and e.args[0][0] == 5:
-                # (5, 'Connection refused')
-                LOG.warn(f"Socks5Error: do you have Tor running? {e.args[0]}")
-                raise SyniToxError(f"{e.args}")
-            elif len(e.args[0]) == 2 and e.args[0][0] in [1, 6]:
-                # (6, 'TTL expired'), 1, ('general SOCKS server failure')
-                # Missing mapping for virtual address '172.17.140.117'. Refusing.
-                LOG.warn(f"Socks5Error: {e.args[0]}")
-                return
+            if len(e.args[0]) == 2:
+                if e.args[0][0] == 2:
+                    LOG.warn(f"Socks5Error: do you have Tor SafeSocks set? {e.args[0]}")
+                elif e.args[0][0] == 5:
+                    # (5, 'Connection refused')
+                    LOG.warn(f"Socks5Error: do you have Tor running? {e.args[0]}")
+                    raise SyniToxError(f"{e.args}")
+                elif e.args[0][0] in [1, 6, 0]:
+                    # (0, "connection closed unexpectedly")
+                    # (6, 'TTL expired'),
+                    # 1, ('general SOCKS server failure')
+                    # Missing mapping for virtual address '172.17.140.117'. Refusing.
+                    LOG.warn(f"Socks5Error: {e.args[0]}")
+                    return
             else:
                 LOG.error(f"Socks5Error: {e.args}")
                 raise SyniToxError(f"{e.args}")
@@ -618,12 +619,16 @@ class SyniTox(Tox):
             return
 
         self.irc = irc
-        if not self._oArgs.irc_ssl:
-            self.irc.send(bytes('NICK ' + nick + '\r\n', 'UTF-8' ))
-            self.irc.send(bytes('USER %s %s bla :%s\r\n' % (
-                          self._oArgs.irc_ident,
-                          self._oArgs.irc_host,
-                          self._oArgs.irc_name), 'UTF-8'))
+        self.irc.send(bytes('CAP ' + 'LS' + '\r\n', 'UTF-8' ))
+        self.irc.send(bytes('CAP ' + 'REQ :multi-prefix' + '\r\n', 'UTF-8'))
+        self.irc.send(bytes('CAP ' + 'END' + '\r\n', 'UTF-8' ))
+        # withh or without  self._oArgs.irc_pem:
+        LOG.info("Sent CAP sending NICK and USER")
+        self.irc.send(bytes('NICK ' + nick + '\r\n', 'UTF-8' ))
+        self.irc.send(bytes('USER %s %s bla :%s\r\n' % (
+                      self._oArgs.irc_ident,
+                      self._oArgs.irc_host,
+                      self._oArgs.irc_name), 'UTF-8'))
 
          # OSError: [Errno 9] Bad file descriptor
          
@@ -643,7 +648,7 @@ class SyniTox(Tox):
                 self.test_net()
             lNodes = self._settings['current_nodes_tcp']
             shuffle(lNodes)
-            LOG.debug(f'TCP bootstapping 6')
+            LOG.info(f'TCP bootstapping 6')
             ts.bootstrap_tcp(lNodes[:6], [self])
 
     def get_all_groups(self):
@@ -714,8 +719,8 @@ class SyniTox(Tox):
         if b'NOTICE AUTH' in lines[0]:
             for line in lines[:99]:
                 if b'NOTICE AUTH' not in line: return
-                line = str(line, 'UTF-8').strip()
-                print(line)
+                lines = str(line, 'UTF-8').strip().split()
+                print(' '.join(lines[1:]))
         else:
             for line in lines[:5]:
                 line = str(line, 'UTF-8').strip().lower()
@@ -740,44 +745,68 @@ class SyniTox(Tox):
             l = line.rstrip().split()
             if len(l) < 2:
                 print(line)
-            elif l[1] not in ['372']:
+            elif l[1] in ['PING']:
+                print(line)
+            elif l[1] in ['372']:
+                LOG.info('MOTD')
+            elif l[1] not in ['372', '353']:
                 i = line.find(' ')
                 print(line[i+1:])
-            else:
-                LOG.info('MOTD')
+            
             rx = re.match(r':(.*?)!.*? PRIVMSG %s :(.*?)\r' %
                     self._oArgs.irc_chan, line, re.S)
-            if rx:
-                self.relay_message(rx)
+            if l[0] == 'QUIT':
+                LOG.info('QUIT')
+                return
+            if len(l) == 1:
+               self.irc_send('PING %s\r\n' % '#tor')
             elif l[0] == 'PING':
                self.irc_send('PONG %s\r\n' % l[1])
+            elif rx:
+                self.relay_message(rx)
             elif len(l) < 2:
                 pass
             elif l[1] in ['461', '431']:
                 pass
-            elif l[1] in ['433', '462', '477']:
+            elif l[1] in ['433']:
+                # maybe should be an outright fail
                 if self._oArgs.irc_ssl:
+                    LOG.warn("Maybe the certificate was not received")
+                #? raise SyniToxError(line)
+                # sometimes but not always:
+                # 433 * SyniTox :Nickname is already in use.
+                # app.ts ERROR SSL error: (32, 'EPIPE')
+                # or instead
+                # 451 *  :Register first.
+                # error :closing link: 185.38.175.131 (registration timed out)
+                # or instead: just
+                # app.ts ERROR SSL error: (32, 'EPIPE')
+                pass
+            elif l[1] in ['451', '462', '477']:
+                if self._oArgs.irc_crt and self._oArgs.irc_key:
                     LOG.warn("Maybe the certificate was not received")
                 raise SyniToxError(line)
             elif l[1] in ['376']:
                 # :End of /MOTD command
-                if self._oArgs.irc_ssl != '':
+                if self._oArgs.irc_crt and self._oArgs.irc_key:
                     pass
                 elif email == '' and pwd:
-                    LOG.info(bytes('PRIVMSG NickServ IDENTIFY %s %s\r\n'
+                    LOG.info(bytes(sMSG+' NickServ IDENTIFY %s %s\r\n'
                             % (nick, pwd,), 'UTF-8'))
-                    self.irc.send(bytes('PRIVMSG NickServ IDENTIFY %s %s\r\n'
-                                        % (nick, pwd,), 'UTF-8'))
+                    self.irc.send(bytes(sMSG+' NickServ IDENTIFY %s %s\r\n'
+                                        % (pwd,nick, ), 'UTF-8'))
                 elif email != '' and pwd:
-                    LOG.info(bytes('PRIVMSG NickServ REGISTER %s %s\r\n'
+                    LOG.info(bytes(sMSG+' NickServ REGISTER %s %s\r\n'
                                    % (pwd, email,), 'UTF-8'))
-                    self.irc.send(bytes('PRIVMSG NickServ REGISTER %s %s\r\n'
+                    self.irc.send(bytes(sMSG+' NickServ REGISTER %s %s\r\n'
                             % (pwd, email,), 'UTF-8'))
                 else:
                     LOG.error("you must provide a password to register")
                     raise RuntimeError("you must provide a password to register")
                 try:                
-                    self.irc.send(bytes('JOIN %s\r\n' % self._oArgs.irc_chan, 'UTF-8'))
+                    self.irc.send(bytes(sMSG+' NickServ set cloak on\r\n', 'UTF-8'))
+                    if self._oArgs.irc_chan:
+                        self.irc.send(bytes('JOIN %s\r\n' % self._oArgs.irc_chan, 'UTF-8'))
                 except BrokenPipeError:
                     raise SyniToxError('BrokenPipeError')
                     
@@ -868,7 +897,7 @@ class SyniTox(Tox):
                 dht_conneted = self.self_get_connection_status()
                 if not dht_conneted:
                     self.dht_init()
-                    LOG.info(f'Not DHT connected {iCount} iterating {10 + iDelay} seconds')
+                    LOG.info(f'Not DHT connected {iCount} iterating {iDelay} seconds')
                     iDelay = iDelay + iDelay // 10
                     self.do(iDelay)
                     #drop through
@@ -930,7 +959,7 @@ class SyniTox(Tox):
                     iDelay = 10
 
                 self.irc_readlines()
-                
+                self.do(iDelay)
         return 0
 
     def quit(self):
@@ -979,7 +1008,7 @@ class SyniTox(Tox):
             if message.startswith('>'):
                 message = '\x0309%s\x03' % message
 
-            self.irc_send(b'PRIVMSG %s :[%s]: %s\r\n' %
+            self.irc_send(bsMSG+' %s :[%s]: %s\r\n' %
                           (self._oArgs.irc_chan, name, message))
             if message.startswith('^'):
                 self.handle_command(message)
@@ -991,8 +1020,8 @@ class SyniTox(Tox):
             print('TOX> %s: %s' % (name, action))
             if action.startswith('>'):
                 action = '\x0309%s\x03' % action
-            self.irc_send('PRIVMSG %s :\x01ACTION [%s]: %s\x01\r\n' %
-                    (self._oArgs.irc_chan, name, action))
+            self.irc_send(bytes(sMSG+' %s :\x01ACTION [%s]: %s\x01\r\n' %
+                                (self._oArgs.irc_chan, name, action), 'UTF-8'))
 
     def on_friend_request(self, pk, message):
         LOG.info('Friend request from %s: %s' % (pk, message))
@@ -1014,7 +1043,7 @@ class SyniTox(Tox):
     def send_both(self, content):
         type_ = TOX_MESSAGE_TYPE['NORMAL']
         self.ensure_exe(self.group_send_message, self.sGROUP_BOT_NUM, type_, content)
-        self.irc_send('PRIVMSG %s :%s\r\n' % (self._oArgs.irc_chan, content))
+        self.irc_send(bytes(sMSG+' %s :%s\r\n' % (self._oArgs.irc_chan, content), 'UTF-8'))
 
     def handle_command(self, cmd):
         cmd = cmd[1:]
@@ -1155,8 +1184,10 @@ def oArgparse(lArgv):
     parser.add_argument('--irc_cadir', type=str,
                         help="Certificate Authority directory",
                         default=CAcs[0])
-    parser.add_argument('--irc_pem', type=str, default='',
-                        help="Certificate and key as pem; use openssl req -x509 -nodes -newkey rsa:2048")
+    parser.add_argument('--irc_crt', type=str, default='',
+                        help="Certificate as pem; use openssl req -x509 -nodes -newkey rsa:2048")
+    parser.add_argument('--irc_key', type=str, default='',
+                        help="Key as pem; use openssl req -x509 -nodes -newkey rsa:2048")
     parser.add_argument('--irc_fp', type=str, default='',
                         help="fingerprint of the pem added with CERT ADD; use openssl x509 -noout -fingerprint -SHA1 -text")
     parser.add_argument('--irc_nick', type=str, default='',
@@ -1210,6 +1241,9 @@ def main(lArgs=None):
     if lArgs is None: lArgs = []
     global     oTOX_OARGS
     oTOX_OARGS = oArgparse(lArgs)
+    
+    ts.clean_booleans(oTOX_OARGS)
+
     assert oTOX_OARGS.irc_host or oTOX_OARGS.irc_connect
     if not oTOX_OARGS.irc_connect:
         oTOX_OARGS.irc_connect = oTOX_OARGS.irc_host
@@ -1217,8 +1251,10 @@ def main(lArgs=None):
         assert os.path.isdir(oTOX_OARGS.irc_cadir)
     if oTOX_OARGS.irc_cafile:
         assert os.path.isfile(oTOX_OARGS.irc_cafile)
+        
     global oTOX_OPTIONS
     oTOX_OPTIONS = oToxygenToxOptions(oTOX_OARGS)
+    
     ts.vSetupLogging(oTOX_OARGS)
 #    ts.setup_logging(oArgs)
 
