@@ -119,7 +119,6 @@ if [ "$TLS" -ne 0 ] ; then
     fi
     ls -l -s $SD/$NICK.pem 
 fi
-exit 0
 
 declare -a RARGS
 if [ "$DEBUG" = 1 ] ; then
